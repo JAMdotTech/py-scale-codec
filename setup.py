@@ -137,10 +137,11 @@ setup(
         # These classifiers are *not* checked by 'pip install'. See instead
         # 'python_requires' below.
         'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.6',
-        'Programming Language :: Python :: 3.7',
-        'Programming Language :: Python :: 3.8',
-        'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
+        'Programming Language :: Python :: 3.13',
+        'Programming Language :: Python :: 3.14',
+        'Programming Language :: Python :: 3.15',
     ],
 
     # This field adds keywords for your project which will appear on the
@@ -167,8 +168,7 @@ setup(
     # do not support Python 2, you can simplify this to '>=3.5' or similar, see
     # https://packaging.python.org/guides/distributing-packages-using-setuptools/#python-requires
 
-    #python_requires='>=2.7, !=3.0.*, !=3.1.*, !=3.2.*, !=3.3.*, <4',
-    python_requires='>=3.6, <4',
+    python_requires='>=3.11, <4',
 
     # This field lists other packages that your project depends on to run.
     # Any package you put here will be installed by pip when your project is
@@ -176,7 +176,15 @@ setup(
     #
     # For an analysis of "install_requires" vs pip's requirements files see:
     # https://packaging.python.org/en/latest/requirements.html
-    install_requires=['more-itertools', 'base58>=2.0.1', 'requests>=2.24.0'],  # Optional
+    install_requires=[
+        'base58>=2.0.1',
+        'more-itertools',
+        'requests>=2.34.2',
+        # Requests allows older versions of these dependencies with known advisories.
+        'certifi>=2026.10.19',
+        'idna>=3.15',
+        'urllib3>=2.8.0',
+    ],
 
     # List additional groups of dependencies here (e.g. development
     # dependencies). Users will be able to install these using the "extras"
@@ -188,7 +196,7 @@ setup(
     # projects.
     extras_require={  # Optional
         #'dev': ['check-manifest'],
-        'test': ['coverage', 'pytest'],
+        'test': ['coverage>=7.17.1', 'pytest>=9.1'],
     },
 
     # If there are data files included in your packages that need to be

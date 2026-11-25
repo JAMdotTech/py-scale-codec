@@ -27,6 +27,13 @@ if TYPE_CHECKING:
     from scalecodec.types import GenericMetadataVersioned, GenericRegistryType
 
 
+def _get_original_decoder_class(decoder_class):
+    """Recover the codec identity of a runtime-bound class or portable primitive."""
+    if decoder_class is None:
+        return None
+    return decoder_class.__dict__.get('_original_decoder_class', decoder_class)
+
+
 class Singleton(type):
     _instances = {}
 
@@ -55,6 +62,7 @@ class RuntimeConfigurationObject:
     def __init__(self, config_id=None, ss58_format=None, only_primitives_on_init=False, implements_scale_info=False):
         self.config_id = config_id
         self.type_registry = {'types': {}, 'runtime_api': {}}
+        self._bound_decoder_classes = {}
         self.__initial_state = False
         self.clear_type_registry()
         self.active_spec_version_id = None
@@ -99,9 +107,42 @@ class RuntimeConfigurationObject:
 
         return name
 
+    def _create_decoder_class(self, name, bases, attributes):
+        return type(name, bases, {**attributes, 'runtime_config': self, '_runtime_defined': True})
+
+    def _bind_decoder_class(self, decoder_class):
+        # Copied registries and classes supplied by callers may refer to another runtime.
+        decoder_class = decoder_class.__dict__.get('_declared_decoder_class', decoder_class)
+        bound_class = self._bound_decoder_classes.get(decoder_class)
+        if bound_class is None or bound_class.runtime_config is not self:
+            # Preserve subclass checks against both imported and runtime-bound decoder bases.
+            bound_bases = tuple(dict.fromkeys(
+                self._bind_decoder_class(base) for base in decoder_class.__bases__
+                if base is not ScaleDecoder and issubclass(base, ScaleDecoder)
+            ))
+            attributes = {
+                '__module__': decoder_class.__module__,
+                '__doc__': decoder_class.__doc__,
+                '_original_decoder_class': _get_original_decoder_class(decoder_class),
+            }
+            if not getattr(decoder_class, '_runtime_defined', False):
+                attributes['_declared_decoder_class'] = decoder_class
+
+            bound_class = self._create_decoder_class(decoder_class.__name__, (decoder_class,) + bound_bases, attributes)
+            self._bound_decoder_classes[decoder_class] = bound_class
+        return bound_class
+
+    def _get_registered_decoder_class(self, type_string):
+        decoder_class = self.type_registry.get('types', {}).get(type_string.lower())
+        if decoder_class is not None and getattr(decoder_class, 'runtime_config', None) is not self:
+            # The registry can also contain decoder classes supplied directly by callers.
+            return self._bind_decoder_class(decoder_class)
+        return decoder_class
+
     def get_decoder_class(self, type_string: Union[str, dict]):
         """
-        Lookup and return a ScaleDecoder class for given `type_string`
+        Look up a ScaleDecoder class bound to this runtime. The returned class can be
+        instantiated directly and can be a subclass of the imported decoder class.
 
         Parameters
         ----------
@@ -114,11 +155,9 @@ class RuntimeConfigurationObject:
 
         if type(type_string) is dict:
             # Inner struct
-            decoder_class = type('InnerStruct', (self.get_decoder_class('Struct'),), {
+            return self._create_decoder_class('InnerStruct', (self.get_decoder_class('Struct'),), {
                 'type_mapping': tuple(type_string.items())
             })
-            decoder_class.runtime_config = self
-            return decoder_class
 
         if type_string.strip() == '':
             return None
@@ -126,7 +165,7 @@ class RuntimeConfigurationObject:
         if self.implements_scale_info is False:
             type_string = self.convert_type_string(type_string)
 
-        decoder_class = self.type_registry.get('types', {}).get(type_string.lower(), None)
+        decoder_class = self._get_registered_decoder_class(type_string)
 
         if not decoder_class:
 
@@ -141,14 +180,16 @@ class RuntimeConfigurationObject:
 
                 if type_parts:
                     # Create dynamic class for Part1<Part2> based on Part1 and set class variable Part2 as sub_type
-                    base_class = self.type_registry.get('types', {}).get(type_parts[0].lower(), None)
+                    base_class = self._get_registered_decoder_class(type_parts[0])
                     if base_class:
-                        decoder_class = type(type_string, (base_class,), {'sub_type': type_parts[1]})
+                        decoder_class = self._create_decoder_class(type_string, (base_class,), {
+                            'sub_type': type_parts[1]
+                        })
 
             # Custom tuples
             elif type_string != '()' and type_string[0] == '(' and type_string[-1] == ')':
 
-                decoder_class = type(type_string, (self.get_decoder_class('tuple'),), {
+                decoder_class = self._create_decoder_class(type_string, (self.get_decoder_class('tuple'),), {
                     'type_string': type_string
                 })
 
@@ -162,14 +203,10 @@ class RuntimeConfigurationObject:
 
                 if type_parts:
                     # Create dynamic class for e.g. [u8; 4] resulting in array of u8 with 4 elements
-                    decoder_class = type(type_string, (self.get_decoder_class('FixedLengthArray'),), {
+                    decoder_class = self._create_decoder_class(type_string, (self.get_decoder_class('FixedLengthArray'),), {
                         'sub_type': type_parts[0],
                         'element_count': int(type_parts[1])
                     })
-
-        if decoder_class:
-            # Attach RuntimeConfigurationObject to new class
-            decoder_class.runtime_config = self
 
         return decoder_class
 
@@ -177,6 +214,7 @@ class RuntimeConfigurationObject:
         """
         Creates a new `ScaleType` object with given type_string, for example 'u32', 'Bytes' or 'scale_info::2'
         (scale_info:: prefixed types are defined in the `PortableRegistry` object of the runtime metadata.)
+        The object uses this runtime unless a different `runtime_config` is passed.
 
         Parameters
         ----------
@@ -198,18 +236,21 @@ class RuntimeConfigurationObject:
     def clear_type_registry(self):
 
         if not self.__initial_state:
-            self.type_registry = {'types': {}, 'runtime_api': {}}
+            # Skip runtime-generated classes and their descendants during default discovery.
+            declared_classes = set()
+            pending = ScaleDecoder.__subclasses__()
+            while pending:
+                decoder_class = pending.pop()
+                if decoder_class in declared_classes or getattr(decoder_class, '_runtime_defined', False):
+                    continue
+                declared_classes.add(decoder_class)
+                pending.extend(decoder_class.__subclasses__())
 
-            # Class names that contains '<' are excluded because of a side effect that is introduced in
-            # get_decoder_class: "Create dynamic class for Part1<Part2> based on Part1 and set class variable Part2 as
-            # sub_type" which won't get reset because class definitions always remain globally
-
-            self.type_registry['types'].update(
-                {
-                    cls.__name__.lower(): cls for cls in self.all_subclasses(ScaleDecoder)
-                    if '<' not in cls.__name__ and '::' not in cls.__name__
-                }
-            )
+            types = {
+                cls.__name__.lower(): cls for cls in declared_classes
+                if '<' not in cls.__name__ and '::' not in cls.__name__
+            }
+            self.type_registry = {'types': types, 'runtime_api': {}}
 
         self.__initial_state = True
 
@@ -234,25 +275,25 @@ class RuntimeConfigurationObject:
                 if decoder_class_data['type'] == 'struct':
 
                     if base_cls is None:
-                        base_cls = Struct
+                        base_cls = self._bind_decoder_class(Struct)
 
-                    decoder_class = type(type_string, (base_cls,), {
+                    decoder_class = self._create_decoder_class(type_string, (base_cls,), {
                         'type_mapping': decoder_class_data.get('type_mapping')
                     })
 
                 elif decoder_class_data['type'] == 'tuple':
 
                     if base_cls is None:
-                        base_cls = Tuple
+                        base_cls = self._bind_decoder_class(Tuple)
 
-                    decoder_class = type(type_string, (base_cls,), {
+                    decoder_class = self._create_decoder_class(type_string, (base_cls,), {
                         'type_mapping': decoder_class_data.get('type_mapping')
                     })
 
                 elif decoder_class_data['type'] == 'enum':
 
                     if base_cls is None:
-                        base_cls = Enum
+                        base_cls = self._bind_decoder_class(Enum)
 
                     value_list = decoder_class_data.get('value_list')
 
@@ -260,7 +301,7 @@ class RuntimeConfigurationObject:
                         # Transform value_list with explicitly specified index numbers
                         value_list = {i: v for v, i in value_list.items()}
 
-                    decoder_class = type(type_string, (base_cls,), {
+                    decoder_class = self._create_decoder_class(type_string, (base_cls,), {
                         'value_list': value_list,
                         'type_mapping': decoder_class_data.get('type_mapping')
                     })
@@ -268,9 +309,9 @@ class RuntimeConfigurationObject:
                 elif decoder_class_data['type'] == 'set':
 
                     if base_cls is None:
-                        base_cls = Set
+                        base_cls = self._bind_decoder_class(Set)
 
-                    decoder_class = type(type_string, (base_cls,), {
+                    decoder_class = self._create_decoder_class(type_string, (base_cls,), {
                         'value_list': decoder_class_data.get('value_list'),
                         'value_type': decoder_class_data.get('value_type', 'u64')
                     })
@@ -378,23 +419,28 @@ class RuntimeConfigurationObject:
 
             if base_decoder_class and hasattr(base_decoder_class, 'process_scale_info_definition'):
                 # if process_scale_info_definition is implemented result is final
-                decoder_class = type(type_string, (base_decoder_class,), {})
+                decoder_class = self._create_decoder_class(type_string, (base_decoder_class,), {})
                 decoder_class.process_scale_info_definition(scale_info_type, prefix)
-
-                # Link ScaleInfo RegistryType to decoder class
                 decoder_class.scale_info_type = scale_info_type
 
                 return decoder_class
 
         if "primitive" in scale_info_type.value["def"]:
-            decoder_class = self.get_decoder_class(scale_info_type.value["def"]["primitive"])
+            primitive_class = self.get_decoder_class(scale_info_type.value["def"]["primitive"])
+            if primitive_class is None:
+                return None
+
+            # The primitive name is also used for type decomposition.
+            decoder_class = self._create_decoder_class(primitive_class.__name__, (primitive_class,), {
+                '_original_decoder_class': _get_original_decoder_class(primitive_class)
+            })
 
         elif 'array' in scale_info_type.value['def']:
 
             if base_decoder_class is None:
                 base_decoder_class = self.get_decoder_class('FixedLengthArray')
 
-            decoder_class = type(type_string, (base_decoder_class,), {
+            decoder_class = self._create_decoder_class(type_string, (base_decoder_class,), {
                 'sub_type': f"{prefix}::{scale_info_type.value['def']['array']['type']}",
                 'element_count': scale_info_type.value['def']['array']['len']
             })
@@ -420,13 +466,13 @@ class RuntimeConfigurationObject:
             if base_decoder_class is None:
                 base_decoder_class = self.get_decoder_class(base_type_string)
 
-            decoder_class = type(type_string, (base_decoder_class,), {
+            decoder_class = self._create_decoder_class(type_string, (base_decoder_class,), {
                 'type_mapping': type_mapping
             })
 
         elif 'sequence' in scale_info_type.value['def']:
             # Vec
-            decoder_class = type(type_string, (self.get_decoder_class('Vec'),), {
+            decoder_class = self._create_decoder_class(type_string, (self.get_decoder_class('Vec'),), {
                 'sub_type': f"{prefix}::{scale_info_type.value['def']['sequence']['type']}"
             })
 
@@ -464,7 +510,7 @@ class RuntimeConfigurationObject:
             if base_decoder_class is None:
                 base_decoder_class = self.get_decoder_class("Enum")
 
-            decoder_class = type(type_string, (base_decoder_class,), {
+            decoder_class = self._create_decoder_class(type_string, (base_decoder_class,), {
                 'type_mapping': type_mapping
             })
 
@@ -472,21 +518,21 @@ class RuntimeConfigurationObject:
 
             type_mapping = [f"{prefix}::{f}" for f in scale_info_type.value['def']['tuple']]
 
-            decoder_class = type(type_string, (self.get_decoder_class('Tuple'),), {
+            decoder_class = self._create_decoder_class(type_string, (self.get_decoder_class('Tuple'),), {
                 'type_mapping': type_mapping
             })
 
         elif 'compact' in scale_info_type.value['def']:
             # Compact
-            decoder_class = type(type_string, (self.get_decoder_class('Compact'),), {
+            decoder_class = self._create_decoder_class(type_string, (self.get_decoder_class('Compact'),), {
                 'sub_type': f"{prefix}::{scale_info_type.value['def']['compact']['type']}"
             })
 
         elif 'phantom' in scale_info_type.value['def']:
-            decoder_class = type(type_string, (self.get_decoder_class('Null'),), {})
+            decoder_class = self._create_decoder_class(type_string, (self.get_decoder_class('Null'),), {})
 
         elif 'bitsequence' in scale_info_type.value['def']:
-            decoder_class = type(type_string, (self.get_decoder_class('BitVec'),), {})
+            decoder_class = self._create_decoder_class(type_string, (self.get_decoder_class('BitVec'),), {})
 
         else:
             raise NotImplementedError(f"RegistryTypeDef {scale_info_type.value['def']} not implemented")
@@ -518,12 +564,12 @@ class RuntimeConfigurationObject:
             if decoder_class is None:
                 raise NotImplementedError(f"No decoding class found for scale type {idx}")
 
-            if decoder_class:
-                self.type_registry['types'][type_string] = decoder_class
+            self.__initial_state = False
+            self.type_registry['types'][type_string] = decoder_class
 
-                if len(scale_info_type['type'].value.get('path', [])) > 0:
-                    path_string = '::'.join(scale_info_type['type'].value['path']).lower()
-                    self.type_registry['types'][path_string] = decoder_class
+            if len(scale_info_type['type'].value.get('path', [])) > 0:
+                path_string = '::'.join(scale_info_type['type'].value['path']).lower()
+                self.type_registry['types'][path_string] = decoder_class
 
     def add_portable_registry(self, metadata: 'GenericMetadataVersioned', prefix=None):
 
@@ -707,6 +753,12 @@ class ScaleDecoder(ABC):
 
     runtime_config = None
 
+    @classmethod
+    def _get_class_runtime_config(cls):
+        if cls.runtime_config is not None:
+            return cls.runtime_config
+        return RuntimeConfiguration()
+
     def __init__(self, data: ScaleBytes, sub_type: str = None, runtime_config: RuntimeConfigurationObject = None):
         """
         Constructs an SCALE codec class capable of encoding and decoding SCALE-bytes
@@ -717,6 +769,8 @@ class ScaleDecoder(ABC):
         sub_type
         runtime_config
         """
+        self.runtime_config = runtime_config if runtime_config is not None else self._get_class_runtime_config()
+
         if sub_type:
             self.sub_type = sub_type
 
@@ -725,13 +779,6 @@ class ScaleDecoder(ABC):
 
         if data:
             assert(type(data) == ScaleBytes)
-
-        if runtime_config:
-            self.runtime_config = runtime_config
-
-        if not self.runtime_config:
-            # if no runtime config is provided, fallback on singleton
-            self.runtime_config = RuntimeConfiguration()
 
         self.data = data
 
@@ -915,7 +962,10 @@ class ScaleDecoder(ABC):
         ScaleBytes
         """
 
-        if value and issubclass(self.__class__, value.__class__):
+        if value and (
+            issubclass(type(self), type(value))
+            or issubclass(_get_original_decoder_class(type(self)), _get_original_decoder_class(type(value)))
+        ):
             # Accept instance of current class directly
             self.data = value.data
             self.value_object = value.value_object

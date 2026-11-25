@@ -23,7 +23,7 @@ from typing import Union, Optional
 from scalecodec.constants import TYPE_DECOMP_MAX_RECURSIVE
 from scalecodec.utils.ss58 import ss58_decode_account_index, ss58_decode, ss58_encode, is_valid_ss58_address
 
-from scalecodec.base import ScaleType, ScaleBytes, ScalePrimitive
+from scalecodec.base import ScaleType, ScaleBytes, ScalePrimitive, _get_original_decoder_class
 from scalecodec.exceptions import InvalidScaleTypeValueException, MetadataCallFunctionNotFound
 from scalecodec.utils.math import trailing_zeros, next_power_of_two
 
@@ -99,7 +99,7 @@ class Compact(ScaleType):
         if cls.sub_type is None:
             return cls.__name__
 
-        scale_obj = cls.runtime_config.create_scale_object(cls.sub_type)
+        scale_obj = cls._get_class_runtime_config().create_scale_object(cls.sub_type)
         return scale_obj.generate_type_decomposition(_recursion_level=_recursion_level + 1, max_recursion=max_recursion)
 
 
@@ -172,7 +172,7 @@ class Option(ScaleType):
         if cls.sub_type is None:
             raise ValueError("'sub_type' is not set")
 
-        sub_type_obj = cls.runtime_config.create_scale_object(cls.sub_type)
+        sub_type_obj = cls._get_class_runtime_config().create_scale_object(cls.sub_type)
         return None, sub_type_obj.generate_type_decomposition(
             _recursion_level=_recursion_level + 1, max_recursion=max_recursion
         )
@@ -197,7 +197,7 @@ class Bytes(ScaleType):
             return '0x{}'.format(value.hex())
 
     def process_encode(self, value):
-        string_length_compact = CompactU32()
+        string_length_compact = CompactU32(runtime_config=self.runtime_config)
 
         if type(value) is str:
             if value[0:2] == '0x':
@@ -246,7 +246,7 @@ class OptionBytes(ScaleType):
     def process_encode(self, value):
 
         if value is not None:
-            sub_type_obj = Bytes()
+            sub_type_obj = Bytes(runtime_config=self.runtime_config)
             return ScaleBytes('0x01') + sub_type_obj.encode(value)
 
         return ScaleBytes('0x00')
@@ -271,7 +271,7 @@ class HexBytes(ScaleType):
 
         value = bytes.fromhex(value[2:])
 
-        string_length_compact = CompactU32()
+        string_length_compact = CompactU32(runtime_config=self.runtime_config)
         data = string_length_compact.encode(len(value))
         data += value
         return data
@@ -617,7 +617,7 @@ class Struct(ScaleType):
         result = {}
         for key, data_type in cls.type_mapping:
             if data_type is not None:
-                scale_obj = cls.runtime_config.create_scale_object(data_type)
+                scale_obj = cls._get_class_runtime_config().create_scale_object(data_type)
                 data_type = scale_obj.generate_type_decomposition(
                     _recursion_level=_recursion_level + 1, max_recursion=max_recursion
                 )
@@ -682,7 +682,7 @@ class Tuple(ScaleType):
         if cls.type_mapping:
             for member_type in cls.type_mapping:
                 if member_type is not None:
-                    scale_obj = cls.runtime_config.create_scale_object(member_type)
+                    scale_obj = cls._get_class_runtime_config().create_scale_object(member_type)
                     member_type = scale_obj.generate_type_decomposition(
                         _recursion_level=_recursion_level + 1, max_recursion=max_recursion
                     )
@@ -959,7 +959,7 @@ class Vec(ScaleType):
         element_count = self.process_type('Compact<u32>').value
 
         # Check for Bytes processing
-        if self.runtime_config.get_decoder_class(self.sub_type) is U8:
+        if _get_original_decoder_class(self.runtime_config.get_decoder_class(self.sub_type)) is U8:
             self.value_object = self.get_next_bytes(element_count)
 
             try:
@@ -980,11 +980,11 @@ class Vec(ScaleType):
     def process_encode(self, value):
 
         # encode element count to Compact<u32>
-        element_count_compact = CompactU32()
+        element_count_compact = CompactU32(runtime_config=self.runtime_config)
 
         # Check for Bytes processing
-        if self.runtime_config.get_decoder_class(self.sub_type) is U8:
-            string_length_compact = CompactU32()
+        if _get_original_decoder_class(self.runtime_config.get_decoder_class(self.sub_type)) is U8:
+            string_length_compact = CompactU32(runtime_config=self.runtime_config)
 
             if type(value) is str:
                 if value[0:2] == '0x':
@@ -1033,7 +1033,7 @@ class Vec(ScaleType):
         if cls.sub_type is None:
             raise ValueError("'sub_type' is not set")
 
-        sub_obj = cls.runtime_config.create_scale_object(cls.sub_type)
+        sub_obj = cls._get_class_runtime_config().create_scale_object(cls.sub_type)
         sub_type_decomp = sub_obj.generate_type_decomposition(
             _recursion_level=_recursion_level + 1, max_recursion=max_recursion
         )
@@ -1097,7 +1097,7 @@ class BitVec(ScaleType):
             return ScaleBytes(b'\x00')
 
         # encode the length in a compact u32
-        compact_obj = CompactU32()
+        compact_obj = CompactU32(runtime_config=self.runtime_config)
         data = compact_obj.encode(value.bit_length())
 
         byte_length = math.ceil(value.bit_length() / 8)
@@ -1152,7 +1152,7 @@ class GenericAddress(ScaleType):
                 value = '0x{}'.format(ss58_decode(value))
             else:
                 from scalecodec.utils.ss58 import ss58_decode_account_index
-                index_obj = GenericAccountIndex()
+                index_obj = GenericAccountIndex(runtime_config=self.runtime_config)
                 value = index_obj.encode(ss58_decode_account_index(value))
 
         if type(value) == str and value[0:2] == '0x' and len(value) == 66:
@@ -1190,7 +1190,7 @@ class AccountIdAddress(GenericAddress):
                 value = '0x{}'.format(ss58_decode(value))
             else:
                 from scalecodec.utils.ss58 import ss58_decode_account_index
-                index_obj = GenericAccountIndex()
+                index_obj = GenericAccountIndex(runtime_config=self.runtime_config)
                 value = index_obj.encode(ss58_decode_account_index(value))
 
         if type(value) == str and value[0:2] == '0x' and len(value) == 66:
@@ -1321,7 +1321,7 @@ class Enum(ScaleType):
                 if data_type == 'Null':
                     data_type = None
                 if data_type is not None:
-                    scale_obj = cls.runtime_config.create_scale_object(data_type)
+                    scale_obj = cls._get_class_runtime_config().create_scale_object(data_type)
                     data_type = scale_obj.generate_type_decomposition(
                         _recursion_level=_recursion_level + 1, max_recursion=max_recursion
                     )
@@ -1510,9 +1510,10 @@ class GenericVote(U8):
 
     @classmethod
     def generate_type_decomposition(cls, _recursion_level: int = 0, max_recursion: int = TYPE_DECOMP_MAX_RECURSIVE):
+        conviction = cls._get_class_runtime_config().create_scale_object('Conviction')
         return {
             'aye': 'bool',
-            'conviction': cls.runtime_config.create_scale_object('Conviction').generate_type_decomposition()
+            'conviction': conviction.generate_type_decomposition()
         }
 
 
@@ -1875,7 +1876,7 @@ class WrapperKeepOpaque(Struct):
             raise ValueError("'type_mapping' is not set")
 
         # Return decomposition of wrapped type
-        wrapped_obj = cls.runtime_config.create_scale_object(
+        wrapped_obj = cls._get_class_runtime_config().create_scale_object(
             type_string=cls.type_mapping[1]
         )
         return wrapped_obj.generate_type_decomposition(
@@ -1900,15 +1901,20 @@ class MultiAccountId(GenericAccountId):
                 account = '0x{}'.format(ss58_decode(account))
             account_ids.append(account)
 
-        account_list_cls = cls.runtime_config.create_scale_object('Vec<AccountId>')
-        account_list_data = account_list_cls.encode(sorted(account_ids))
-        threshold_data = cls.runtime_config.create_scale_object("u16").encode(threshold)
+        runtime_config = cls._get_class_runtime_config()
+        account_type = 'AccountId'
+        if cls.runtime_config is None and runtime_config.get_decoder_class(account_type) is None:
+            account_type = 'GenericAccountId'
+
+        account_list = runtime_config.create_scale_object(f'Vec<{account_type}>')
+        account_list_data = account_list.encode(sorted(account_ids))
+        threshold_data = runtime_config.create_scale_object('u16').encode(threshold)
 
         multi_account_id = "0x{}".format(blake2b(
             b"modlpy/utilisuba" + bytes(account_list_data.data) + bytes(threshold_data.data), digest_size=32
         ).digest().hex())
 
-        multi_account_obj = cls(runtime_config=cls.runtime_config)
+        multi_account_obj = cls(runtime_config=runtime_config)
         multi_account_obj.encode(multi_account_id)
         multi_account_obj.signatories = sorted(account_ids)
         multi_account_obj.threshold = threshold
@@ -1925,7 +1931,7 @@ class FixedLengthArray(ScaleType):
     def process(self):
 
         if self.element_count:
-            if self.runtime_config.get_decoder_class(self.sub_type) is U8:
+            if _get_original_decoder_class(self.runtime_config.get_decoder_class(self.sub_type)) is U8:
                 self.value_object = self.get_next_bytes(self.element_count)
                 return '0x{}'.format(self.value_object.hex())
             else:
@@ -1942,7 +1948,7 @@ class FixedLengthArray(ScaleType):
 
         value = value or []
 
-        if self.runtime_config.get_decoder_class(self.sub_type) is U8:
+        if _get_original_decoder_class(self.runtime_config.get_decoder_class(self.sub_type)) is U8:
             # u8 arrays are represented as bytes or hex-bytes (e.g. [u8; 3] as 0x123456)
             if type(value) is str and value[0:2] == '0x':
                 value = bytes.fromhex(value[2:])
@@ -1976,7 +1982,7 @@ class FixedLengthArray(ScaleType):
         if cls.sub_type is None:
             raise ValueError("'sub_type' is not set")
 
-        sub_cls = cls.runtime_config.get_decoder_class(cls.sub_type)
+        sub_cls = cls._get_class_runtime_config().get_decoder_class(cls.sub_type)
         sub_cls_decomp = sub_cls.generate_type_decomposition(
             _recursion_level=_recursion_level + 1, max_recursion=max_recursion
         )
@@ -2091,7 +2097,7 @@ class Map(ScaleType):
         if type(value) is not list:
             raise ValueError("value should be a list of tuples e.g.: [('1', 2), ('23', 24), ('28', 30), ('45', 80)]")
 
-        element_count_compact = CompactU32()
+        element_count_compact = CompactU32(runtime_config=self.runtime_config)
 
         element_count_compact.encode(len(value))
 
